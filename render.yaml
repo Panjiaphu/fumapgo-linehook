@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fumapgo-linehook
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    healthCheckPath: /health
+    envVars:
+      - key: APP_MODE
+        value: fumapgo
+      - key: FGO_BASE_URL
+        value: https://fumapgo.onrender.com
