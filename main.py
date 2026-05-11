@@ -146,8 +146,16 @@ def get_google_credentials():
         raise RuntimeError("google-api-python-client/google-auth is not installed")
 
     raw = GOOGLE_SERVICE_ACCOUNT_JSON.strip()
+
     if not raw and GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip():
-        raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip()).decode("utf-8")
+        candidate = GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip().strip('"').strip("'")
+        # Step 11A robustness:
+        # If the value is raw JSON by mistake, accept it.
+        # Otherwise decode it as base64.
+        if candidate.startswith("{"):
+            raw = candidate
+        else:
+            raw = base64.b64decode(candidate).decode("utf-8")
 
     if not raw:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64 is not set")
@@ -248,6 +256,57 @@ def post_photo_metadata_to_fgo(payload: dict) -> dict:
         return {"ok": r.ok, "status_code": r.status_code, "body": body}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+
+def parse_fu_delivery_command(text: str) -> dict:
+    """
+    Supported:
+      fu FG-20260511-074026 ok 8893
+      ok FG-20260511-074026 8893
+      完成 FG-20260511-074026 8893
+    """
+    raw = (text or "").strip()
+    order_code = normalize_order_code(raw)
+    if not order_code:
+        return {}
+
+    lower = raw.lower()
+    is_fu = lower.startswith("fu ") and " ok" in lower
+    is_ok = lower.startswith("ok ") or lower.startswith("完成")
+    if not (is_fu or is_ok):
+        return {}
+
+    # Extract digits after the order code. Use last 4-6 digit group as delivery code.
+    tail = raw.upper().split(order_code, 1)[-1]
+    groups = re.findall(r"\b(\d{4,6})\b", tail)
+    delivery_code = groups[-1] if groups else ""
+
+    return {
+        "order_code": order_code,
+        "delivery_code": delivery_code,
+    }
+
+
+def post_delivery_code_to_fgo(payload: dict) -> dict:
+    if not FGO_INTERNAL_SECRET:
+        return {"ok": False, "error": "FGO_INTERNAL_SECRET not set"}
+
+    url = f"{FGO_BASE_URL}/internal/delivery/code"
+    headers = {
+        "Content-Type": "application/json",
+        "X-FGO-INTERNAL-SECRET": FGO_INTERNAL_SECRET,
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:500]}
+        return {"ok": r.ok, "status_code": r.status_code, "body": body}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 
 def handle_image_proof(user_id: str, message_id: str) -> dict:
@@ -390,6 +449,44 @@ def callback():
                 clear_photo_session(user_id)
                 reply_message(reply_token, [text_message("已清除拍照綁定。")])
 
+            elif parse_fu_delivery_command(raw_text):
+                cmd = parse_fu_delivery_command(raw_text)
+                if not cmd.get("delivery_code"):
+                    reply_message(reply_token, [text_message(
+                        "請補上收貨碼後四碼，例如：\n"
+                        f"fu {cmd['order_code']} ok 8893\n\n"
+                        "面交完成需要收貨碼，避免爭議。"
+                    )])
+                else:
+                    result = post_delivery_code_to_fgo({
+                        "order_code": cmd["order_code"],
+                        "delivery_code": cmd["delivery_code"],
+                        "line_user_id": user_id,
+                        "actor_role": "DRIVER",
+                        "source": "LINE_FU_OK_COMMAND",
+                        "created_at": now_iso(),
+                    })
+                    if result.get("ok"):
+                        proof_url = f"{FGO_BASE_URL}/proof/{cmd['order_code']}?role=customer&view=mobile&lang=zh"
+                        reply_message(reply_token, [text_message(
+                            "✅ 面交收貨碼已確認\n"
+                            f"訂單：{cmd['order_code']}\n"
+                            "DELIVERY_CODE_BLOCK 已建立。\n\n"
+                            f"證明頁：{proof_url}"
+                        )])
+                        if FGO_ADMIN_LINE_USER_ID and FGO_ADMIN_LINE_USER_ID != user_id:
+                            push_message(FGO_ADMIN_LINE_USER_ID, [text_message(
+                                "✅ FUGO 訂單已用收貨碼完成\n"
+                                f"訂單：{cmd['order_code']}\n"
+                                f"證明頁：{proof_url}"
+                            )])
+                    else:
+                        reply_message(reply_token, [text_message(
+                            "收貨碼確認失敗 ⚠️\n"
+                            "請確認訂單碼、後四碼、FGO internal secret。\n\n"
+                            f"Result: {json.dumps(result, ensure_ascii=False)[:900]}"
+                        )])
+
             elif text.startswith("photo") or text.startswith("拍照"):
                 if not order_code:
                     reply_message(reply_token, [text_message(
@@ -402,7 +499,8 @@ def callback():
                     reply_message(reply_token, [text_message(
                         f"已綁定照片證明訂單：{order_code}\n"
                         "現在請直接傳送交付照片。\n\n"
-                        "系統會下載 LINE 照片、上傳 Google Drive，並回寫 FGO 建立 PHOTO_DELIVERY_BLOCK。"
+                        "系統會下載 LINE 照片、上傳 Google Drive，並回寫 FGO 建立 PHOTO_DELIVERY_BLOCK。\n\n"
+                        f"若為面交收貨碼完成，也可以輸入：fu {order_code} ok 後四碼"
                     )])
 
             elif text.startswith("bind"):
@@ -503,9 +601,11 @@ def internal_photo_session():
     push_result = None
     if payload.get("push_hint", True):
         push_result = push_message(line_user_id, [text_message(
-            f"📷 請上傳交付照片\n"
+            f"📷 FUGO 交付證明\n"
             f"訂單：{order_code}\n\n"
-            "請直接在此聊天室傳送照片，系統會自動建立 PHOTO_DELIVERY_BLOCK。"
+            "拍照交付：請直接在此聊天室傳送照片，系統會自動建立 PHOTO_DELIVERY_BLOCK。\n\n"
+            f"手交收貨碼：輸入 fu {order_code} ok 後四碼\n"
+            f"例如：fu {order_code} ok 8893"
         )])
 
     return jsonify({
