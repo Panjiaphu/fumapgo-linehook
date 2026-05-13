@@ -31,7 +31,7 @@ LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
 FGO_BASE_URL = os.getenv("FGO_BASE_URL", "https://fumapgo.onrender.com").rstrip("/")
 FGO_INTERNAL_SECRET = os.getenv("FGO_INTERNAL_SECRET", "")
 FGO_ADMIN_LINE_USER_ID = os.getenv("FGO_ADMIN_LINE_USER_ID", "")
-APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-step11e2b")
+APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-step6-9")
 
 GOOGLE_DRIVE_PROOF_FOLDER_ID = os.getenv("GOOGLE_DRIVE_PROOF_FOLDER_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -47,6 +47,16 @@ SESSION_PATH = Path(os.getenv("PHOTO_SESSION_PATH", "/tmp/fumapgo_photo_sessions
 
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def json_ok(**kwargs):
+    payload = {"ok": True, **kwargs}
+    return jsonify(payload)
+
+
+def json_fail(message: str, status_code: int = 400, **kwargs):
+    payload = {"ok": False, "error": message, **kwargs}
+    return jsonify(payload), status_code
 
 
 def line_headers(content_type="application/json"):
@@ -66,40 +76,158 @@ def fgo_json_headers():
 def verify_line_signature(body: bytes, signature: str) -> bool:
     if not LINE_CHANNEL_SECRET:
         return False
-    digest = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).digest()
+
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected, signature or "")
 
 
+def require_internal_secret():
+    if not FGO_INTERNAL_SECRET:
+        return False, "FGO_INTERNAL_SECRET not set"
+
+    incoming = request.headers.get("X-FGO-INTERNAL-SECRET", "")
+
+    if not incoming:
+        return False, "X-FGO-INTERNAL-SECRET missing"
+
+    if not hmac.compare_digest(incoming, FGO_INTERNAL_SECRET):
+        return False, "invalid internal secret"
+
+    return True, ""
+
+
 def text_message(text: str):
-    return {"type": "text", "text": text[:5000]}
+    return {
+        "type": "text",
+        "text": str(text or "")[:5000],
+    }
+
+
+def image_message(image_url: str, preview_url: str = ""):
+    preview_url = preview_url or image_url
+
+    return {
+        "type": "image",
+        "originalContentUrl": image_url,
+        "previewImageUrl": preview_url,
+    }
 
 
 def reply_message(reply_token: str, messages: list):
     if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
-        return {"ok": False, "error": "missing token"}
-    payload = {"replyToken": reply_token, "messages": messages[:5]}
-    r = requests.post(LINE_REPLY_URL, headers=line_headers(), json=payload, timeout=15)
-    return {"ok": r.ok, "status_code": r.status_code, "body": r.text[:500]}
+        return {"ok": False, "error": "missing LINE token or reply token"}
+
+    payload = {
+        "replyToken": reply_token,
+        "messages": messages[:5],
+    }
+
+    try:
+        r = requests.post(
+            LINE_REPLY_URL,
+            headers=line_headers(),
+            json=payload,
+            timeout=15,
+        )
+
+        return {
+            "ok": bool(r.ok),
+            "status_code": r.status_code,
+            "body": r.text[:500],
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def push_message(to: str, messages: list):
-    if not LINE_CHANNEL_ACCESS_TOKEN or not to:
-        return {"ok": False, "error": "missing token or target"}
-    payload = {"to": to, "messages": messages[:5]}
-    r = requests.post(LINE_PUSH_URL, headers=line_headers(), json=payload, timeout=15)
-    return {"ok": r.ok, "status_code": r.status_code, "body": r.text[:500]}
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return {"ok": False, "error": "LINE_CHANNEL_ACCESS_TOKEN not set"}
+
+    if not to:
+        return {"ok": False, "error": "target LINE user id missing"}
+
+    payload = {
+        "to": to,
+        "messages": messages[:5],
+    }
+
+    try:
+        r = requests.post(
+            LINE_PUSH_URL,
+            headers=line_headers(),
+            json=payload,
+            timeout=15,
+        )
+
+        body = {}
+        if r.text:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:500]}
+
+        return {
+            "ok": bool(r.ok),
+            "status_code": r.status_code,
+            "body": body,
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def push_text(to: str, text: str):
+    return push_message(to, [text_message(text)])
+
+
+def push_image(to: str, image_url: str, preview_url: str = "", text: str = ""):
+    image_url = (image_url or "").strip()
+    preview_url = (preview_url or image_url).strip()
+
+    if not image_url:
+        return {"ok": False, "error": "image_url missing"}
+
+    if not image_url.startswith("https://"):
+        return {
+            "ok": False,
+            "error": "LINE image URL must be public HTTPS",
+            "image_url": image_url,
+        }
+
+    messages = []
+
+    if text:
+        messages.append(text_message(text))
+
+    messages.append(image_message(image_url, preview_url))
+
+    return push_message(to, messages)
 
 
 def get_line_profile(user_id: str) -> dict:
     if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
         return {}
+
     try:
         url = LINE_PROFILE_URL.format(user_id=quote_plus(user_id))
-        r = requests.get(url, headers=line_headers(content_type=None), timeout=10)
+        r = requests.get(
+            url,
+            headers=line_headers(content_type=None),
+            timeout=10,
+        )
+
         if not r.ok:
             return {}
+
         return r.json()
+
     except Exception:
         return {}
 
@@ -107,6 +235,7 @@ def get_line_profile(user_id: str) -> dict:
 def fgo_post(path: str, payload: dict) -> dict:
     if not FGO_INTERNAL_SECRET:
         return {"ok": False, "error": "FGO_INTERNAL_SECRET not set"}
+
     try:
         r = requests.post(
             f"{FGO_BASE_URL}{path}",
@@ -114,11 +243,18 @@ def fgo_post(path: str, payload: dict) -> dict:
             json=payload,
             timeout=20,
         )
+
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text[:500]}
-        return {"ok": r.ok, "status_code": r.status_code, "body": body}
+
+        return {
+            "ok": bool(r.ok),
+            "status_code": r.status_code,
+            "body": body,
+        }
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -126,6 +262,7 @@ def fgo_post(path: str, payload: dict) -> dict:
 def fgo_get(path: str, params=None) -> dict:
     if not FGO_INTERNAL_SECRET:
         return {"ok": False, "error": "FGO_INTERNAL_SECRET not set"}
+
     try:
         r = requests.get(
             f"{FGO_BASE_URL}{path}",
@@ -133,11 +270,18 @@ def fgo_get(path: str, params=None) -> dict:
             params=params or {},
             timeout=20,
         )
+
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text[:500]}
-        return {"ok": r.ok, "status_code": r.status_code, "body": body}
+
+        return {
+            "ok": bool(r.ok),
+            "status_code": r.status_code,
+            "body": body,
+        }
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -151,7 +295,11 @@ def fgo_resolve_line_user(line_user_id: str) -> dict:
 
 
 def manual_bind_url(user_id: str, role: str = "customer") -> str:
-    return f"{FGO_BASE_URL}/line/bind?line_user_id={quote_plus(user_id or '')}&role={quote_plus(role)}&view=mobile&lang=zh"
+    return (
+        f"{FGO_BASE_URL}/line/bind"
+        f"?line_user_id={quote_plus(user_id or '')}"
+        f"&role={quote_plus(role)}&view=mobile&lang=zh"
+    )
 
 
 def admin_approval_url() -> str:
@@ -168,8 +316,9 @@ def menu_text(user_id: str = ""):
         "我的入口\n"
         "我的身份\n\n"
         "【交付證明】\n"
-        "photo FG-訂單碼\n"
-        "fu FG-訂單碼 ok 後四碼\n\n"
+        "建議優先使用 Webapp 上傳照片。\n"
+        "備用指令：photo FG-訂單碼\n"
+        "備用完成：fu FG-訂單碼 ok 後四碼\n\n"
         "【一般入口】\n"
         f"店家入口：{FGO_BASE_URL}/store?view=mobile&lang=zh\n"
         f"外送員接單：{FGO_BASE_URL}/driver?view=mobile&lang=zh\n"
@@ -191,25 +340,32 @@ def load_sessions() -> dict:
             return json.loads(SESSION_PATH.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[SESSION_LOAD_ERROR] {e}", flush=True)
+
     return {}
 
 
 def save_sessions(data: dict):
     try:
         SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        SESSION_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     except Exception as e:
         print(f"[SESSION_SAVE_ERROR] {e}", flush=True)
 
 
 def set_photo_session(line_user_id: str, order_code: str, actor_role="DRIVER") -> dict:
     sessions = load_sessions()
+
     sessions[line_user_id] = {
         "order_code": order_code,
         "actor_role": actor_role,
         "created_at": now_iso(),
     }
+
     save_sessions(sessions)
+
     return sessions[line_user_id]
 
 
@@ -219,6 +375,7 @@ def get_photo_session(line_user_id: str) -> dict:
 
 def clear_photo_session(line_user_id: str):
     sessions = load_sessions()
+
     if line_user_id in sessions:
         sessions.pop(line_user_id)
         save_sessions(sessions)
@@ -232,6 +389,7 @@ def get_google_credentials():
 
     if not raw and GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip():
         candidate = GOOGLE_SERVICE_ACCOUNT_JSON_B64.strip().strip('"').strip("'")
+
         if candidate.startswith("{"):
             raw = candidate
         else:
@@ -241,13 +399,25 @@ def get_google_credentials():
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64 is not set")
 
     info = json.loads(raw)
+
+    if "private_key" in info and "\\n" in info["private_key"]:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
     scopes = ["https://www.googleapis.com/auth/drive.file"]
-    return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=scopes,
+    )
 
 
 def upload_to_google_drive(local_path: str, file_name: str, mime_type: str) -> dict:
     if not GOOGLE_DRIVE_PROOF_FOLDER_ID:
-        return {"ok": False, "skipped": True, "error": "GOOGLE_DRIVE_PROOF_FOLDER_ID not set"}
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "GOOGLE_DRIVE_PROOF_FOLDER_ID not set",
+        }
 
     creds = get_google_credentials()
     service = build("drive", "v3", credentials=creds)
@@ -256,7 +426,13 @@ def upload_to_google_drive(local_path: str, file_name: str, mime_type: str) -> d
         "name": file_name,
         "parents": [GOOGLE_DRIVE_PROOF_FOLDER_ID],
     }
-    media = MediaFileUpload(local_path, mimetype=mime_type or "image/jpeg", resumable=False)
+
+    media = MediaFileUpload(
+        local_path,
+        mimetype=mime_type or "image/jpeg",
+        resumable=False,
+    )
+
     created = service.files().create(
         body=metadata,
         media_body=media,
@@ -272,23 +448,38 @@ def upload_to_google_drive(local_path: str, file_name: str, mime_type: str) -> d
     except Exception as e:
         print(f"[GOOGLE_DRIVE_PERMISSION_WARNING] {e}", flush=True)
 
+    file_id = created.get("id", "")
+
     return {
         "ok": True,
-        "file_id": created.get("id", ""),
+        "file_id": file_id,
         "name": created.get("name", file_name),
         "web_view_link": created.get("webViewLink", ""),
         "web_content_link": created.get("webContentLink", ""),
+        "public_image_url": f"https://drive.google.com/uc?export=view&id={file_id}" if file_id else "",
     }
 
 
 def download_line_content(message_id: str) -> dict:
     url = LINE_CONTENT_URL.format(message_id=message_id)
-    r = requests.get(url, headers=line_headers(content_type=None), stream=True, timeout=30)
+
+    r = requests.get(
+        url,
+        headers=line_headers(content_type=None),
+        stream=True,
+        timeout=30,
+    )
+
     if not r.ok:
-        return {"ok": False, "status_code": r.status_code, "error": r.text[:500]}
+        return {
+            "ok": False,
+            "status_code": r.status_code,
+            "error": r.text[:500],
+        }
 
     content_type = r.headers.get("Content-Type", "image/jpeg")
     suffix = ".jpg"
+
     if "png" in content_type:
         suffix = ".png"
     elif "webp" in content_type:
@@ -296,13 +487,19 @@ def download_line_content(message_id: str) -> dict:
     elif "gif" in content_type:
         suffix = ".gif"
 
-    fd, temp_path = tempfile.mkstemp(prefix="fgo_line_photo_", suffix=suffix)
+    fd, temp_path = tempfile.mkstemp(
+        prefix="fgo_line_photo_",
+        suffix=suffix,
+    )
+
     size = 0
     sha = hashlib.sha256()
+
     with os.fdopen(fd, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 64):
             if not chunk:
                 continue
+
             size += len(chunk)
             sha.update(chunk)
             f.write(chunk)
@@ -324,12 +521,14 @@ def post_photo_metadata_to_fgo(payload: dict) -> dict:
 def parse_fu_delivery_command(text: str) -> dict:
     raw = (text or "").strip()
     order_code = normalize_order_code(raw)
+
     if not order_code:
         return {}
 
     lower = raw.lower()
     is_fu = lower.startswith("fu ") and " ok" in lower
     is_ok = lower.startswith("ok ") or lower.startswith("完成")
+
     if not (is_fu or is_ok):
         return {}
 
@@ -349,6 +548,7 @@ def post_delivery_code_to_fgo(payload: dict) -> dict:
 
 def parse_line_binding_command(text: str) -> dict:
     raw = (text or "").strip()
+
     if not raw:
         return {}
 
@@ -359,11 +559,19 @@ def parse_line_binding_command(text: str) -> dict:
     if m:
         return {"role": "CUSTOMER", "value": m.group(3).strip()}
 
-    m = re.match(r"^(綁定|绑定)\s*(店家|商家|店鋪|店铺|store)\s+(.+)$", cleaned, flags=re.IGNORECASE)
+    m = re.match(
+        r"^(綁定|绑定)\s*(店家|商家|店鋪|店铺|store)\s+(.+)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     if m:
         return {"role": "STORE", "value": m.group(3).strip().upper()}
 
-    m = re.match(r"^(綁定|绑定)\s*(外送員|外送员|司機|司机|騎手|骑手|driver|shipper)\s+(.+)$", cleaned, flags=re.IGNORECASE)
+    m = re.match(
+        r"^(綁定|绑定)\s*(外送員|外送员|司機|司机|騎手|骑手|driver|shipper)\s+(.+)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     if m:
         return {"role": "DRIVER", "value": m.group(3).strip().upper()}
 
@@ -393,6 +601,7 @@ def role_label(role: str) -> str:
 
 def handle_line_binding(user_id: str, reply_token: str, raw_text: str) -> bool:
     cmd = parse_line_binding_command(raw_text)
+
     if not cmd:
         return False
 
@@ -412,8 +621,10 @@ def handle_line_binding(user_id: str, reply_token: str, raw_text: str) -> bool:
     if role == "CUSTOMER":
         payload["customer_phone"] = re.sub(r"[^\d+]", "", value)
         payload["customer_name"] = display_name or "LINE Customer"
+
     elif role == "STORE":
         payload["store_code"] = value.upper()
+
     elif role == "DRIVER":
         payload["driver_code"] = value.upper()
         payload["driver_name"] = display_name or value.upper()
@@ -428,51 +639,80 @@ def handle_line_binding(user_id: str, reply_token: str, raw_text: str) -> bool:
         entry_url = urls.get("entry_url") or ""
 
         if active:
-            reply_message(reply_token, [text_message(
-                "✅ LINE 綁定完成\n"
-                f"角色：{role_label(role)}\n"
-                f"綁定資料：{value}\n"
-                f"LINE User ID：{user_id}\n\n"
-                f"我的入口：{entry_url}\n\n"
-                "之後輸入「我的入口」即可回到你的 FUGO 頁面。"
-            )])
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "✅ LINE 綁定完成\n"
+                        f"角色：{role_label(role)}\n"
+                        f"綁定資料：{value}\n"
+                        f"LINE User ID：{user_id}\n\n"
+                        f"我的入口：{entry_url}\n\n"
+                        "之後輸入「我的入口」即可回到你的 FUGO 頁面。"
+                    )
+                ],
+            )
+
         elif pending:
-            pending_url = body.get("pending_url") or manual_bind_url(user_id, role.lower())
-            reply_message(reply_token, [text_message(
-                "⏳ 綁定申請已送出，等待管理員審核\n"
-                f"角色：{role_label(role)}\n"
-                f"申請資料：{value}\n"
-                f"LINE User ID：{user_id}\n\n"
-                "目前政策：\n"
-                "客戶：自動啟用\n"
-                "店家 / 外送員：需 Admin 審核後才能使用\n\n"
-                f"查看狀態：{pending_url}"
-            )])
+            pending_url = body.get("pending_url") or manual_bind_url(
+                user_id,
+                role.lower(),
+            )
+
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "⏳ 綁定申請已送出，等待管理員審核\n"
+                        f"角色：{role_label(role)}\n"
+                        f"申請資料：{value}\n"
+                        f"LINE User ID：{user_id}\n\n"
+                        "目前政策：\n"
+                        "客戶：自動啟用\n"
+                        "店家 / 外送員：需 Admin 審核後才能使用\n\n"
+                        f"查看狀態：{pending_url}"
+                    )
+                ],
+            )
 
             if FGO_ADMIN_LINE_USER_ID and FGO_ADMIN_LINE_USER_ID != user_id:
-                push_message(FGO_ADMIN_LINE_USER_ID, [text_message(
+                push_text(
+                    FGO_ADMIN_LINE_USER_ID,
                     "🔔 FUGO 新的 LINE 綁定審核\n"
                     f"角色：{role_label(role)}\n"
                     f"申請資料：{value}\n"
                     f"LINE User ID：{user_id}\n\n"
-                    f"後台審核：{admin_approval_url()}"
-                )])
+                    f"後台審核：{admin_approval_url()}",
+                )
+
         else:
-            reply_message(reply_token, [text_message(
-                "綁定狀態未知 ⚠️\n"
-                f"Result: {json.dumps(body, ensure_ascii=False)[:1200]}"
-            )])
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "綁定狀態未知 ⚠️\n"
+                        f"Result: {json.dumps(body, ensure_ascii=False)[:1200]}"
+                    )
+                ],
+            )
+
     else:
         manual_url = manual_bind_url(user_id, role.lower())
-        reply_message(reply_token, [text_message(
-            "LINE 綁定失敗 ⚠️\n"
-            "請確認：\n"
-            "1. FGO_INTERNAL_SECRET 是否一致\n"
-            "2. FUGO Step 11E-3 是否已部署\n"
-            "3. Store Code / Driver Code 格式是否正確\n\n"
-            f"你也可以手動綁定：{manual_url}\n\n"
-            f"Result: {json.dumps(result, ensure_ascii=False)[:1200]}"
-        )])
+
+        reply_message(
+            reply_token,
+            [
+                text_message(
+                    "LINE 綁定失敗 ⚠️\n"
+                    "請確認：\n"
+                    "1. FGO_INTERNAL_SECRET 是否一致\n"
+                    "2. FumapGo webapp 是否已部署\n"
+                    "3. Store Code / Driver Code 格式是否正確\n\n"
+                    f"你也可以手動綁定：{manual_url}\n\n"
+                    f"Result: {json.dumps(result, ensure_ascii=False)[:1200]}"
+                )
+            ],
+        )
 
     return True
 
@@ -492,35 +732,59 @@ def handle_my_entry(user_id: str, reply_token: str) -> bool:
         if active:
             urls = body.get("urls") or {}
             entry_url = urls.get("entry_url") or ""
-            reply_message(reply_token, [text_message(
-                "✅ 我的 FUGO 入口\n"
-                f"角色：{role_label(active_role)}\n"
-                f"LINE User ID：{user_id}\n\n"
-                f"入口：{entry_url}\n\n"
-                f"信用區塊：{urls.get('block_url','')}"
-            )])
+
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "✅ 我的 FUGO 入口\n"
+                        f"角色：{role_label(active_role)}\n"
+                        f"LINE User ID：{user_id}\n\n"
+                        f"入口：{entry_url}\n\n"
+                        f"信用區塊：{urls.get('block_url', '')}"
+                    )
+                ],
+            )
+
             return True
 
         if pending:
-            pending_url = body.get("pending_url") or manual_bind_url(user_id, active_role.lower())
-            reply_message(reply_token, [text_message(
-                "⏳ 你的帳號正在等待管理員審核\n"
-                f"角色：{role_label(active_role)}\n"
-                f"狀態：{status} / {approval_status}\n\n"
-                "店家與外送員需要 Admin 通過後才能進入正式頁面。\n\n"
-                f"查看狀態：{pending_url}"
-            )])
+            pending_url = body.get("pending_url") or manual_bind_url(
+                user_id,
+                active_role.lower(),
+            )
+
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "⏳ 你的帳號正在等待管理員審核\n"
+                        f"角色：{role_label(active_role)}\n"
+                        f"狀態：{status} / {approval_status}\n\n"
+                        "店家與外送員需要 Admin 通過後才能進入正式頁面。\n\n"
+                        f"查看狀態：{pending_url}"
+                    )
+                ],
+            )
+
             return True
 
     bind_url = manual_bind_url(user_id, "customer")
-    reply_message(reply_token, [text_message(
-        "你尚未綁定 LINE 身份。\n\n"
-        "請先輸入其中一種：\n"
-        "綁定客戶 0900000000\n"
-        "綁定店家 STO-DEMO-ROAST\n"
-        "綁定外送員 DRV-DEMO\n\n"
-        f"手動綁定：{bind_url}"
-    )])
+
+    reply_message(
+        reply_token,
+        [
+            text_message(
+                "你尚未綁定 LINE 身份。\n\n"
+                "請先輸入其中一種：\n"
+                "綁定客戶 0900000000\n"
+                "綁定店家 STO-DEMO-ROAST\n"
+                "綁定外送員 DRV-DEMO\n\n"
+                f"手動綁定：{bind_url}"
+            )
+        ],
+    )
+
     return True
 
 
@@ -530,27 +794,43 @@ def handle_my_identity(user_id: str, reply_token: str) -> bool:
 
     if result.get("ok") and body.get("ok") and body.get("bound"):
         binding = body.get("binding") or {}
+
         lines = [
             "我的 LINE 身份",
             f"LINE User ID：{user_id}",
             f"角色：{role_label(binding.get('active_role', ''))}",
             f"狀態：{binding.get('status', '')} / {binding.get('approval_status', '')}",
         ]
+
         if binding.get("customer_phone"):
             lines.append(f"客戶手機：{binding.get('customer_phone')}")
+
         if binding.get("store_code"):
-            lines.append(f"店家：{binding.get('store_code')} / {binding.get('bound_store_name') or ''}")
+            lines.append(
+                f"店家：{binding.get('store_code')} / {binding.get('bound_store_name') or ''}"
+            )
+
         if binding.get("driver_code"):
-            lines.append(f"外送員：{binding.get('driver_code')} / {binding.get('bound_driver_name') or ''}")
+            lines.append(
+                f"外送員：{binding.get('driver_code')} / {binding.get('bound_driver_name') or ''}"
+            )
+
         if binding.get("approval_note"):
             lines.append(f"備註：{binding.get('approval_note')}")
+
         reply_message(reply_token, [text_message("\n".join(lines))])
         return True
 
-    reply_message(reply_token, [text_message(
-        "尚未綁定 LINE 身份。\n"
-        "請輸入：綁定客戶 / 綁定店家 / 綁定外送員"
-    )])
+    reply_message(
+        reply_token,
+        [
+            text_message(
+                "尚未綁定 LINE 身份。\n"
+                "請輸入：綁定客戶 / 綁定店家 / 綁定外送員"
+            )
+        ],
+    )
+
     return True
 
 
@@ -567,14 +847,27 @@ def handle_image_proof(user_id: str, message_id: str) -> dict:
         }
 
     dl = download_line_content(message_id)
+
     if not dl.get("ok"):
-        return {"ok": False, "message": "下載 LINE 照片失敗。", "download": dl}
+        return {
+            "ok": False,
+            "message": "下載 LINE 照片失敗。",
+            "download": dl,
+        }
 
     file_name = f"{order_code}_{actor_role}_{message_id}{dl['suffix']}"
-    drive = {"ok": False, "skipped": True, "error": "Drive upload not attempted"}
+    drive = {
+        "ok": False,
+        "skipped": True,
+        "error": "Drive upload not attempted",
+    }
 
     try:
-        drive = upload_to_google_drive(dl["path"], file_name, dl["content_type"])
+        drive = upload_to_google_drive(
+            dl["path"],
+            file_name,
+            dl["content_type"],
+        )
     except Exception as e:
         drive = {"ok": False, "error": str(e)}
         print(f"[GOOGLE_DRIVE_UPLOAD_ERROR] {e}", flush=True)
@@ -591,6 +884,7 @@ def handle_image_proof(user_id: str, message_id: str) -> dict:
         "google_drive_file_id": drive.get("file_id", ""),
         "google_drive_url": drive.get("web_view_link", ""),
         "google_drive_download_url": drive.get("web_content_link", ""),
+        "public_image_url": drive.get("public_image_url", ""),
         "drive_upload_result": drive,
         "created_at": now_iso(),
     }
@@ -616,32 +910,154 @@ def handle_image_proof(user_id: str, message_id: str) -> dict:
 
 @app.get("/")
 def index():
-    return jsonify({
-        "ok": True,
-        "app": "fumapgo-linehook",
-        "mode": APP_MODE,
-        "step": "11E-2B_LINE_BINDING_COMMANDS_APPROVAL_STATUS",
-        "time": now_iso(),
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "app": "fumapgo-linehook",
+            "mode": APP_MODE,
+            "step": "6.9_LINEHOOK_COMPATIBILITY",
+            "time": now_iso(),
+        }
+    )
 
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "app": "fumapgo-linehook",
-        "mode": APP_MODE,
-        "step": "11E-2B_LINE_BINDING_COMMANDS_APPROVAL_STATUS",
-        "line_channel_id_set": bool(LINE_CHANNEL_ID),
-        "line_secret_set": bool(LINE_CHANNEL_SECRET),
-        "line_access_token_set": bool(LINE_CHANNEL_ACCESS_TOKEN),
-        "fgo_base_url": FGO_BASE_URL,
-        "fgo_internal_secret_set": bool(FGO_INTERNAL_SECRET),
-        "admin_line_user_id_set": bool(FGO_ADMIN_LINE_USER_ID),
-        "google_drive_folder_set": bool(GOOGLE_DRIVE_PROOF_FOLDER_ID),
-        "google_service_account_set": bool(GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64),
-        "time": now_iso(),
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "app": "fumapgo-linehook",
+            "mode": APP_MODE,
+            "step": "6.9_LINEHOOK_COMPATIBILITY",
+            "line_channel_id_set": bool(LINE_CHANNEL_ID),
+            "line_secret_set": bool(LINE_CHANNEL_SECRET),
+            "line_access_token_set": bool(LINE_CHANNEL_ACCESS_TOKEN),
+            "fgo_base_url": FGO_BASE_URL,
+            "fgo_internal_secret_set": bool(FGO_INTERNAL_SECRET),
+            "admin_line_user_id_set": bool(FGO_ADMIN_LINE_USER_ID),
+            "google_drive_folder_set": bool(GOOGLE_DRIVE_PROOF_FOLDER_ID),
+            "google_service_account_set": bool(
+                GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64
+            ),
+            "internal_push_ready": bool(LINE_CHANNEL_ACCESS_TOKEN and FGO_INTERNAL_SECRET),
+            "internal_push_image_ready": bool(LINE_CHANNEL_ACCESS_TOKEN and FGO_INTERNAL_SECRET),
+            "photo_session_ready": bool(FGO_INTERNAL_SECRET),
+            "routes": [
+                "/callback",
+                "/internal/push",
+                "/internal/push-image",
+                "/internal/photo-session",
+            ],
+            "time": now_iso(),
+        }
+    )
+
+
+@app.post("/internal/push")
+def internal_push():
+    ok, error = require_internal_secret()
+
+    if not ok:
+        return json_fail(error, 401)
+
+    payload = request.get_json(silent=True) or {}
+    to = (payload.get("to") or payload.get("line_user_id") or "").strip()
+    text = str(payload.get("text") or "").strip()
+
+    if not to:
+        return json_fail("to / line_user_id missing", 400)
+
+    if not text:
+        return json_fail("text missing", 400)
+
+    result = push_text(to, text)
+
+    return jsonify(
+        {
+            "ok": bool(result.get("ok")),
+            "result": result,
+            "time": now_iso(),
+        }
+    ), 200 if result.get("ok") else 502
+
+
+@app.post("/internal/push-image")
+def internal_push_image():
+    ok, error = require_internal_secret()
+
+    if not ok:
+        return json_fail(error, 401)
+
+    payload = request.get_json(silent=True) or {}
+    to = (payload.get("to") or payload.get("line_user_id") or "").strip()
+    image_url = (payload.get("image_url") or payload.get("originalContentUrl") or "").strip()
+    preview_url = (payload.get("preview_url") or payload.get("previewImageUrl") or image_url).strip()
+    text = str(payload.get("text") or "").strip()
+
+    if not to:
+        return json_fail("to / line_user_id missing", 400)
+
+    if not image_url:
+        return json_fail("image_url missing", 400)
+
+    result = push_image(to, image_url, preview_url, text)
+
+    return jsonify(
+        {
+            "ok": bool(result.get("ok")),
+            "result": result,
+            "time": now_iso(),
+        }
+    ), 200 if result.get("ok") else 502
+
+
+@app.post("/internal/photo-session")
+def internal_photo_session():
+    ok, error = require_internal_secret()
+
+    if not ok:
+        return json_fail(error, 401)
+
+    payload = request.get_json(silent=True) or {}
+    line_user_id = (
+        payload.get("line_user_id")
+        or payload.get("to")
+        or FGO_ADMIN_LINE_USER_ID
+        or ""
+    ).strip()
+
+    order_code = normalize_order_code(payload.get("order_code") or "")
+    actor_role = (payload.get("actor_role") or "DRIVER").upper()
+    push_hint = bool(payload.get("push_hint", True))
+
+    if not line_user_id:
+        return json_fail("line_user_id missing", 400)
+
+    if not order_code:
+        return json_fail("order_code missing or invalid", 400)
+
+    session = set_photo_session(line_user_id, order_code, actor_role)
+
+    push_result = {"ok": True, "skipped": True}
+
+    if push_hint:
+        push_result = push_text(
+            line_user_id,
+            "📷 FumapGo 照片證明模式已啟用\n"
+            f"訂單：{order_code}\n"
+            f"角色：{role_label(actor_role)}\n\n"
+            "請直接傳送照片。系統會把照片寫入訂單證明。\n"
+            "建議：正式流程優先使用 webapp 上傳照片。",
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "session": session,
+            "push_result": push_result,
+            "time": now_iso(),
+        }
+    )
 
 
 @app.post("/callback")
@@ -663,229 +1079,190 @@ def callback():
         message = event.get("message", {})
         message_type = message.get("type")
 
-        print(json.dumps({
-            "event_type": event_type,
-            "message_type": message_type,
-            "user_id": user_id,
-            "time": now_iso(),
-        }, ensure_ascii=False), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event_type": event_type,
+                    "message_type": message_type,
+                    "user_id": user_id,
+                    "time": now_iso(),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
         if event_type == "follow":
-            reply_message(reply_token, [text_message(
-                "歡迎加入 FUMAP GO 信用外送。\n"
-                "這裡是店家、外送員、顧客的 LINE 中心。\n\n"
-                + menu_text(user_id)
-            )])
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "歡迎加入 FUMAP GO 信用外送。\n"
+                        "這裡是店家、外送員、顧客的 LINE 中心。\n\n"
+                        + menu_text(user_id)
+                    )
+                ],
+            )
 
         elif event_type == "message" and message_type == "text":
             raw_text = (message.get("text") or "").strip()
-            text = raw_text.lower()
+            lower = raw_text.lower()
             order_code = normalize_order_code(raw_text)
 
-            if text in ["ping", "test", "測試"]:
-                reply_message(reply_token, [text_message(
-                    "pong ✅\n"
-                    "FUMAP GO LINE webhook 已連線。\n"
-                    f"User ID：{user_id}"
-                )])
-
-            elif text in ["menu", "選單", "功能", "開始", "start"]:
+            if lower in {"help", "menu", "功能", "選單", "菜单", "開始", "start"}:
                 reply_message(reply_token, [text_message(menu_text(user_id))])
+                continue
 
-            elif text in ["我的入口", "我的fugo", "my fugo", "my entry", "入口", "個人入口", "个人入口"]:
+            if lower == "ping":
+                reply_message(
+                    reply_token,
+                    [
+                        text_message(
+                            "pong\n"
+                            f"mode: {APP_MODE}\n"
+                            f"time: {now_iso()}\n"
+                            f"user_id: {user_id}"
+                        )
+                    ],
+                )
+                continue
+
+            if handle_line_binding(user_id, reply_token, raw_text):
+                continue
+
+            if raw_text in {"我的入口", "入口", "my entry", "entry"}:
                 handle_my_entry(user_id, reply_token)
+                continue
 
-            elif text in ["我的身份", "我的身分", "身份", "身分", "我是誰", "我是谁", "me"]:
+            if raw_text in {"我的身份", "我的身分", "身份", "身分", "my identity"}:
                 handle_my_identity(user_id, reply_token)
+                continue
 
-            elif handle_line_binding(user_id, reply_token, raw_text):
-                pass
+            if lower.startswith("photo ") and order_code:
+                session = set_photo_session(user_id, order_code, "DRIVER")
 
-            elif text in ["clear photo", "取消拍照", "清除拍照"]:
-                clear_photo_session(user_id)
-                reply_message(reply_token, [text_message("已清除拍照綁定。")])
+                reply_message(
+                    reply_token,
+                    [
+                        text_message(
+                            "📷 照片證明模式已啟用\n"
+                            f"訂單：{order_code}\n"
+                            f"建立時間：{session['created_at']}\n\n"
+                            "請直接傳送照片。系統會上傳並回寫 FumapGo。"
+                        )
+                    ],
+                )
+                continue
 
-            elif parse_fu_delivery_command(raw_text):
-                cmd = parse_fu_delivery_command(raw_text)
-                if not cmd.get("delivery_code"):
-                    reply_message(reply_token, [text_message(
-                        "請補上收貨碼後四碼，例如：\n"
-                        f"fu {cmd['order_code']} ok 8893\n\n"
-                        "面交完成需要收貨碼，避免爭議。"
-                    )])
+            fu_cmd = parse_fu_delivery_command(raw_text)
+
+            if fu_cmd:
+                payload = {
+                    "order_code": fu_cmd["order_code"],
+                    "delivery_code": fu_cmd.get("delivery_code", ""),
+                    "line_user_id": user_id,
+                    "source": "LINE_FU_COMMAND",
+                    "created_at": now_iso(),
+                }
+
+                result = post_delivery_code_to_fgo(payload)
+
+                if result.get("ok"):
+                    reply_message(
+                        reply_token,
+                        [
+                            text_message(
+                                "✅ 收貨完成指令已送出\n"
+                                f"訂單：{fu_cmd['order_code']}\n"
+                                f"收貨碼：{fu_cmd.get('delivery_code') or '未提供'}"
+                            )
+                        ],
+                    )
                 else:
-                    result = post_delivery_code_to_fgo({
-                        "order_code": cmd["order_code"],
-                        "delivery_code": cmd["delivery_code"],
-                        "line_user_id": user_id,
-                        "actor_role": "DRIVER",
-                        "source": "LINE_FU_OK_COMMAND",
-                        "created_at": now_iso(),
-                    })
-                    if result.get("ok"):
-                        proof_url = f"{FGO_BASE_URL}/proof/{cmd['order_code']}?role=customer&view=mobile&lang=zh"
-                        reply_message(reply_token, [text_message(
-                            "✅ 面交收貨碼已確認\n"
-                            f"訂單：{cmd['order_code']}\n"
-                            "DELIVERY_CODE_BLOCK 已建立。\n\n"
-                            f"證明頁：{proof_url}"
-                        )])
-                        if FGO_ADMIN_LINE_USER_ID and FGO_ADMIN_LINE_USER_ID != user_id:
-                            push_message(FGO_ADMIN_LINE_USER_ID, [text_message(
-                                "✅ FUGO 訂單已用收貨碼完成\n"
-                                f"訂單：{cmd['order_code']}\n"
-                                f"證明頁：{proof_url}"
-                            )])
-                    else:
-                        reply_message(reply_token, [text_message(
-                            "收貨碼確認失敗 ⚠️\n"
-                            "請確認訂單碼、後四碼、FGO internal secret。\n\n"
-                            f"Result: {json.dumps(result, ensure_ascii=False)[:900]}"
-                        )])
+                    reply_message(
+                        reply_token,
+                        [
+                            text_message(
+                                "⚠️ 收貨完成指令送出失敗\n"
+                                f"Result: {json.dumps(result, ensure_ascii=False)[:1200]}"
+                            )
+                        ],
+                    )
 
-            elif text.startswith("photo") or text.startswith("拍照"):
-                if not order_code:
-                    reply_message(reply_token, [text_message(
-                        "請輸入訂單碼，例如：\n"
-                        "photo FG-20260510-9570E4\n\n"
-                        "然後再傳送交付照片。"
-                    )])
-                else:
-                    set_photo_session(user_id, order_code, actor_role="DRIVER")
-                    reply_message(reply_token, [text_message(
-                        f"已綁定照片證明訂單：{order_code}\n"
-                        "現在請直接傳送交付照片。\n\n"
-                        "系統會下載 LINE 照片、上傳 Google Drive，並回寫 FGO 建立 PHOTO_DELIVERY_BLOCK。\n\n"
-                        f"若為面交收貨碼完成，也可以輸入：fu {order_code} ok 後四碼"
-                    )])
+                continue
 
-            elif text.startswith("bind"):
-                reply_message(reply_token, [text_message(
-                    "請使用完整綁定格式：\n"
-                    "bind customer 0900000000\n"
-                    "bind store STO-DEMO-ROAST\n"
-                    "bind driver DRV-DEMO\n\n"
-                    f"你的 LINE User ID：{user_id}"
-                )])
+            if order_code:
+                reply_message(
+                    reply_token,
+                    [
+                        text_message(
+                            "FumapGo 訂單連結\n\n"
+                            f"訂單：{order_code}\n"
+                            f"客戶頁：{FGO_BASE_URL}/go/order/{order_code}\n"
+                            f"外送頁：{FGO_BASE_URL}/driver/order/{order_code}?view=mobile&lang=zh\n"
+                            f"證明頁：{FGO_BASE_URL}/proof/{order_code}?view=mobile&lang=zh\n\n"
+                            "若要上傳照片備用：\n"
+                            f"photo {order_code}"
+                        )
+                    ],
+                )
+                continue
 
-            else:
-                reply_message(reply_token, [text_message(
-                    "已收到訊息。\n"
-                    "請輸入「menu」查看功能。\n"
-                    "請輸入「我的入口」進入你的 FUGO 頁面。\n"
-                    "若要上傳交付照片，請輸入：photo FG-訂單碼。"
-                )])
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "收到。\n\n"
+                        "可輸入：\n"
+                        "我的入口\n"
+                        "我的身份\n"
+                        "綁定客戶 0900000000\n"
+                        "綁定店家 STO-XXXX\n"
+                        "綁定外送員 DRV-XXXX\n"
+                        "photo FG-訂單碼"
+                    )
+                ],
+            )
 
         elif event_type == "message" and message_type == "image":
             message_id = message.get("id", "")
+
             result = handle_image_proof(user_id, message_id)
 
-            if result.get("need_session"):
-                reply_message(reply_token, [text_message(result["message"])])
-            elif result.get("ok"):
-                drive_url = result["payload"].get("google_drive_url") or "未設定 Google Drive / 尚無連結"
-                proof_url = f"{FGO_BASE_URL}/proof/{result['order_code']}?view=mobile&lang=zh"
-                reply_message(reply_token, [text_message(
-                    "已收到照片 ✅\n"
-                    f"訂單：{result['order_code']}\n"
-                    "PHOTO_DELIVERY_BLOCK 已建立。\n\n"
-                    f"證明頁：{proof_url}\n"
-                    f"Google Drive：{drive_url}"
-                )])
-
-                if FGO_ADMIN_LINE_USER_ID and FGO_ADMIN_LINE_USER_ID != user_id:
-                    push_message(FGO_ADMIN_LINE_USER_ID, [text_message(
-                        "📷 FUMAP GO 交付照片已上傳\n"
-                        f"訂單：{result['order_code']}\n"
-                        f"證明頁：{proof_url}\n"
-                        f"Google Drive：{drive_url}"
-                    )])
+            if result.get("ok"):
+                reply_message(
+                    reply_token,
+                    [
+                        text_message(
+                            "✅ 照片已收到並寫入 FumapGo\n"
+                            f"訂單：{result.get('order_code')}\n\n"
+                            "正式流程仍建議使用 Webapp 上傳，LINE 照片作為備用。"
+                        )
+                    ],
+                )
             else:
-                reply_message(reply_token, [text_message(
-                    "照片處理失敗 ⚠️\n"
-                    "請確認 Google Drive / FGO internal proof endpoint / internal secret。\n\n"
-                    f"LINE messageId：{message_id}"
-                )])
-                print(json.dumps({"photo_proof_error": result}, ensure_ascii=False), flush=True)
+                reply_message(
+                    reply_token,
+                    [
+                        text_message(
+                            result.get("message")
+                            or "⚠️ 照片處理失敗，請稍後再試或聯絡管理員。"
+                        )
+                    ],
+                )
 
         elif event_type == "postback":
-            reply_message(reply_token, [text_message("已收到操作。")])
+            reply_message(
+                reply_token,
+                [
+                    text_message(
+                        "已收到操作。\n"
+                        "目前主要操作請回到 FumapGo Webapp 完成。"
+                    )
+                ],
+            )
 
-    return "OK", 200
-
-
-@app.post("/internal/push")
-def internal_push():
-    secret = request.headers.get("X-FGO-INTERNAL-SECRET", "")
-    if FGO_INTERNAL_SECRET and secret != FGO_INTERNAL_SECRET:
-        abort(403, "Forbidden")
-
-    payload = request.get_json(silent=True) or {}
-    to = (
-        payload.get("to")
-        or payload.get("line_user_id")
-        or payload.get("admin_line_user_id")
-        or FGO_ADMIN_LINE_USER_ID
-    )
-    text = payload.get("text") or "FUMAP GO notification"
-
-    if not to:
-        return jsonify({
-            "ok": False,
-            "error": "missing target LINE user id",
-            "hint": "Set FGO_ADMIN_LINE_USER_ID on linehook or send payload.to",
-        }), 400
-
-    result = push_message(to, [text_message(text)])
-    return jsonify(result)
-
-
-@app.post("/internal/photo-session")
-def internal_photo_session():
-    secret = request.headers.get("X-FGO-INTERNAL-SECRET", "")
-    if FGO_INTERNAL_SECRET and secret != FGO_INTERNAL_SECRET:
-        abort(403, "Forbidden")
-
-    payload = request.get_json(silent=True) or {}
-    order_code = normalize_order_code(payload.get("order_code", ""))
-    line_user_id = payload.get("line_user_id") or payload.get("to") or FGO_ADMIN_LINE_USER_ID
-    actor_role = payload.get("actor_role") or "DRIVER"
-
-    if not order_code:
-        return jsonify({"ok": False, "error": "missing valid order_code"}), 400
-    if not line_user_id:
-        return jsonify({"ok": False, "error": "missing line_user_id and FGO_ADMIN_LINE_USER_ID"}), 400
-
-    session = set_photo_session(line_user_id, order_code, actor_role)
-    push_result = None
-    if payload.get("push_hint", True):
-        push_result = push_message(line_user_id, [text_message(
-            f"📷 FUGO 交付證明\n"
-            f"訂單：{order_code}\n\n"
-            "拍照交付：請直接在此聊天室傳送照片，系統會自動建立 PHOTO_DELIVERY_BLOCK。\n\n"
-            f"手交收貨碼：輸入 fu {order_code} ok 後四碼\n"
-            f"例如：fu {order_code} ok 8893"
-        )])
-
-    return jsonify({
-        "ok": True,
-        "line_user_id": line_user_id,
-        "session": session,
-        "push_result": push_result,
-    })
-
-
-@app.post("/internal/line/resolve-proxy")
-def internal_line_resolve_proxy():
-    secret = request.headers.get("X-FGO-INTERNAL-SECRET", "")
-    if FGO_INTERNAL_SECRET and secret != FGO_INTERNAL_SECRET:
-        abort(403, "Forbidden")
-
-    payload = request.get_json(silent=True) or {}
-    line_user_id = payload.get("line_user_id", "")
-    if not line_user_id:
-        return jsonify({"ok": False, "error": "missing line_user_id"}), 400
-    return jsonify(fgo_resolve_line_user(line_user_id))
+    return jsonify({"ok": True, "time": now_iso()})
 
 
 if __name__ == "__main__":
