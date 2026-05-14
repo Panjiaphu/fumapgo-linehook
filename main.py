@@ -2,7 +2,6 @@ import os
 import hmac
 import base64
 import hashlib
-import json
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
@@ -20,7 +19,7 @@ LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
 FGO_BASE_URL = os.getenv("FGO_BASE_URL", "https://fumapgo.onrender.com").rstrip("/")
 FGO_INTERNAL_SECRET = os.getenv("FGO_INTERNAL_SECRET", "")
 FGO_ADMIN_LINE_USER_ID = os.getenv("FGO_ADMIN_LINE_USER_ID", "")
-APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-step6-15-notification-gateway")
+APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-commercial-binding-gateway")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -50,13 +49,6 @@ def line_headers(content_type="application/json"):
     return headers
 
 
-def fgo_headers():
-    return {
-        "Content-Type": "application/json",
-        "X-FGO-INTERNAL-SECRET": FGO_INTERNAL_SECRET,
-    }
-
-
 def verify_line_signature(body, signature):
     if not LINE_CHANNEL_SECRET:
         return False
@@ -68,7 +60,6 @@ def verify_line_signature(body, signature):
     ).digest()
 
     expected = base64.b64encode(digest).decode("utf-8")
-
     return hmac.compare_digest(expected, signature or "")
 
 
@@ -276,24 +267,43 @@ def role_label(role):
     }.get(role, role or "未知")
 
 
-def web_register_url(role, line_user_id=""):
-    role = (role or "customer").lower()
-    line_user_id = quote_plus(line_user_id or "")
+def normalize_web_role(role):
+    role = (role or "customer").lower().strip()
 
-    if role == "store":
-        return f"{FGO_BASE_URL}/store/register?line_user_id={line_user_id}&view=mobile&lang=zh"
+    if role in ("shipper", "driver"):
+        return "driver"
 
-    if role in ("driver", "shipper"):
-        return f"{FGO_BASE_URL}/driver/register?line_user_id={line_user_id}&view=mobile&lang=zh"
+    if role in ("shop", "store"):
+        return "store"
 
-    return f"{FGO_BASE_URL}/customer/register?line_user_id={line_user_id}&view=mobile&lang=zh"
+    if role == "admin":
+        return "admin"
+
+    return "customer"
 
 
 def web_line_bind_url(role, line_user_id=""):
-    role = quote_plus((role or "customer").lower())
-    line_user_id = quote_plus(line_user_id or "")
+    role = normalize_web_role(role)
+    role_q = quote_plus(role)
+    line_user_id_q = quote_plus(line_user_id or "")
 
-    return f"{FGO_BASE_URL}/line/register?role={role}&line_user_id={line_user_id}&view=mobile&lang=zh"
+    return (
+        f"{FGO_BASE_URL}/line/register"
+        f"?role={role_q}"
+        f"&line_user_id={line_user_id_q}"
+        f"&view=mobile"
+        f"&lang=zh"
+    )
+
+
+def web_register_url(role, line_user_id=""):
+    """
+    Commercial FGO rule:
+    - Store / Driver registration must go through LINE binding.
+    - Customer can also bind here, but customer binding is optional in webapp.
+    - Do not send users to legacy /store/register or /driver/register from LINE.
+    """
+    return web_line_bind_url(role, line_user_id)
 
 
 def admin_ops_url():
@@ -301,33 +311,29 @@ def admin_ops_url():
 
 
 def menu_text(user_id=""):
-    customer_register = web_register_url("customer", user_id)
-    store_register = web_register_url("store", user_id)
-    driver_register = web_register_url("driver", user_id)
-
     customer_bind = web_line_bind_url("customer", user_id)
     store_bind = web_line_bind_url("store", user_id)
     driver_bind = web_line_bind_url("driver", user_id)
 
     return (
         "FumapGo LINE 通知中心\n\n"
-        "現在的規則：\n"
+        "正式規則：\n"
         "Webapp = 註冊 / 下單 / 上傳照片 / 營運\n"
         "LINE = 推送通知 / 客服 / 回到 webapp\n\n"
-        "【快速註冊】\n"
-        f"客戶註冊：{customer_register}\n"
-        f"店家註冊：{store_register}\n"
-        f"外送員註冊：{driver_register}\n\n"
-        "【LINE 綁定】\n"
+        "【註冊 / LINE 綁定】\n"
+        "店家與外送員必須完成 LINE 綁定後，才能等待 admin 審核。\n"
+        "客戶可選擇綁定 LINE；未綁定仍可下單，但不會收到 LINE 推播與送達照片。\n\n"
         f"客戶 LINE 綁定：{customer_bind}\n"
-        f"店家 LINE 綁定：{store_bind}\n"
-        f"外送員 LINE 綁定：{driver_bind}\n\n"
+        f"店家 LINE 綁定 / 註冊：{store_bind}\n"
+        f"外送員 LINE 綁定 / 註冊：{driver_bind}\n\n"
         "【主要入口】\n"
+        f"FumapGo 首頁：{FGO_BASE_URL}/?view=mobile&lang=zh\n"
         f"Marketplace：{FGO_BASE_URL}/go?view=mobile&lang=zh\n"
         f"店家工作台：{FGO_BASE_URL}/store?view=mobile&lang=zh\n"
         f"外送員工作台：{FGO_BASE_URL}/driver?view=mobile&lang=zh\n"
         f"客服：{FGO_BASE_URL}/support/new?view=mobile&lang=zh\n\n"
         "可輸入：\n"
+        "menu\n"
         "我的入口\n"
         "我的身份\n"
         "客服 + 你的問題\n\n"
@@ -373,11 +379,11 @@ def build_entry_text(user_id):
 
     return (
         "你目前還沒有完成 LINE 綁定。\n\n"
-        "請使用下方其中一個入口完成 webapp 註冊或 LINE 綁定：\n\n"
-        f"客戶註冊：{web_register_url('customer', user_id)}\n"
-        f"店家註冊：{web_register_url('store', user_id)}\n"
-        f"外送員註冊：{web_register_url('driver', user_id)}\n\n"
-        f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n\n"
+        "請使用下方入口完成 FumapGo 註冊 / LINE 綁定：\n\n"
+        f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
+        f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
+        f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}\n\n"
+        "注意：店家與外送員必須完成 LINE 綁定並等待 admin 審核，才能正式使用。\n\n"
         f"你的 LINE User ID：{user_id}"
     )
 
@@ -403,10 +409,14 @@ def build_identity_text(user_id):
             lines.append(f"客戶手機：{binding.get('customer_phone')}")
 
         if binding.get("store_code"):
-            lines.append(f"店家：{binding.get('store_code')} / {binding.get('bound_store_name') or ''}")
+            lines.append(
+                f"店家：{binding.get('store_code')} / {binding.get('bound_store_name') or ''}"
+            )
 
         if binding.get("driver_code"):
-            lines.append(f"外送員：{binding.get('driver_code')} / {binding.get('bound_driver_name') or ''}")
+            lines.append(
+                f"外送員：{binding.get('driver_code')} / {binding.get('bound_driver_name') or ''}"
+            )
 
         if binding.get("approval_note"):
             lines.append(f"備註：{binding.get('approval_note')}")
@@ -415,16 +425,20 @@ def build_identity_text(user_id):
 
     return (
         "尚未綁定 LINE 身份。\n\n"
-        f"客戶綁定：{web_line_bind_url('customer', user_id)}\n"
-        f"店家綁定：{web_line_bind_url('store', user_id)}\n"
-        f"外送員綁定：{web_line_bind_url('driver', user_id)}\n\n"
+        f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
+        f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
+        f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}\n\n"
         f"LINE User ID：{user_id}"
     )
 
 
 def forward_customer_service_to_admin(user_id, text="", event_type="text"):
     if not FGO_ADMIN_LINE_USER_ID:
-        return {"ok": False, "skipped": True, "error": "FGO_ADMIN_LINE_USER_ID not set"}
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "FGO_ADMIN_LINE_USER_ID not set",
+        }
 
     profile = get_line_profile(user_id)
     name = profile.get("displayName", "")
@@ -483,8 +497,6 @@ def handle_text_message(user_id, reply_token, text):
             ],
         )
 
-    # Old command cleanup:
-    # We no longer process binding/proof/business commands in LINE.
     legacy_prefixes = (
         "綁定",
         "绑定",
@@ -505,9 +517,9 @@ def handle_text_message(user_id, reply_token, text):
                     "1. 註冊、下單、上傳照片都在 webapp\n"
                     "2. LINE 只負責推送通知與客服\n\n"
                     f"請使用 webapp：{FGO_BASE_URL}/go?view=mobile&lang=zh\n\n"
-                    f"客戶註冊：{web_register_url('customer', user_id)}\n"
-                    f"店家註冊：{web_register_url('store', user_id)}\n"
-                    f"外送員註冊：{web_register_url('driver', user_id)}"
+                    f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
+                    f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
+                    f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}"
                 )
             ],
         )
@@ -540,7 +552,7 @@ def index():
 @app.get("/health")
 def health():
     return json_ok(
-        module="FumapGo LINE Notification Gateway Step 6.15",
+        module="FumapGo LINE Notification Gateway",
         mode=APP_MODE,
         fgo_base_url=FGO_BASE_URL,
         line_token_set=bool(LINE_CHANNEL_ACCESS_TOKEN),
@@ -617,8 +629,12 @@ def internal_push_image():
     if to.upper() == "ADMIN":
         to = FGO_ADMIN_LINE_USER_ID
 
-    image_url = str(payload.get("image_url") or payload.get("public_image_url") or "").strip()
-    preview_url = str(payload.get("preview_url") or payload.get("preview_image_url") or image_url).strip()
+    image_url = str(
+        payload.get("image_url") or payload.get("public_image_url") or ""
+    ).strip()
+    preview_url = str(
+        payload.get("preview_url") or payload.get("preview_image_url") or image_url
+    ).strip()
     text = str(payload.get("text") or payload.get("message") or "").strip()
 
     if not to:
@@ -644,7 +660,8 @@ def internal_push_image():
 
 @app.post("/internal/photo-session")
 def internal_photo_session():
-    """Compatibility endpoint.
+    """
+    Compatibility endpoint.
 
     Old webapp code may still call /internal/photo-session.
     This gateway no longer stores photo sessions or uploads LINE images.
