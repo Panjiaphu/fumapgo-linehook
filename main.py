@@ -18,12 +18,55 @@ LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
 
 FGO_BASE_URL = os.getenv("FGO_BASE_URL", "https://fumapgo.onrender.com").rstrip("/")
 FGO_INTERNAL_SECRET = os.getenv("FGO_INTERNAL_SECRET", "")
-FGO_ADMIN_LINE_USER_ID = os.getenv("FGO_ADMIN_LINE_USER_ID", "")
 APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-commercial-binding-gateway")
+
+# P0 security:
+# LINE must never expose admin URL/token. Admin support falls back to email.
+ADMIN_CONTACT_EMAIL = os.getenv("ADMIN_CONTACT_EMAIL", "panjiaphu@gmail.com")
+PUBLIC_MARKETPLACE_URL = os.getenv(
+    "PUBLIC_MARKETPLACE_URL",
+    f"{FGO_BASE_URL}/go?view=mobile&lang=zh",
+)
+
+# Kept only for backward ENV compatibility. Do not use for CSKH forwarding.
+FGO_ADMIN_LINE_USER_ID = os.getenv("FGO_ADMIN_LINE_USER_ID", "")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_PROFILE_URL = "https://api.line.me/v2/bot/profile/{user_id}"
+
+
+DANGEROUS_LINE_TEXT_KEYS = (
+    "/admin",
+    "admin/ops",
+    "admin/accounting",
+    "admin/line-bindings",
+    "admin/commercial",
+    "admin/dispatch",
+    "admin/payments",
+    "admin/proof",
+    "admin/waitblock",
+    "token=",
+    "fumapgo_admin",
+    "fgo_admin",
+    "FUMAPGO_ADMIN",
+)
+
+ADMIN_INTENT_KEYWORDS = {
+    "admin",
+    "ops",
+    "operator",
+    "manager",
+    "quản lý",
+    "quan ly",
+    "admin ops",
+    "後台",
+    "管理",
+    "管理員",
+    "管理员",
+    "系統管理",
+    "後台管理",
+}
 
 
 def now_iso():
@@ -36,6 +79,37 @@ def json_ok(**kwargs):
 
 def json_fail(message, status_code=400, **kwargs):
     return jsonify({"ok": False, "error": message, **kwargs}), status_code
+
+
+def safe_support_text():
+    return (
+        "已收到訊息。\n\n"
+        "FumapGo LINE 目前作為通知與客服入口使用。\n"
+        "如需處理訂單、付款、外送或管理功能，請回到 FumapGo Webapp。\n\n"
+        f"Marketplace:\n{PUBLIC_MARKETPLACE_URL}\n\n"
+        "系統或管理問題請聯絡 Email:\n"
+        f"{ADMIN_CONTACT_EMAIL}"
+    )
+
+
+def sanitize_line_text(text: str) -> str:
+    """
+    P0 guardrail:
+    Any outgoing LINE text containing admin path/token is replaced.
+    This protects both reply_message and internal push_message.
+    """
+    raw = str(text or "")
+    low = raw.lower()
+
+    for key in DANGEROUS_LINE_TEXT_KEYS:
+        if key.lower() in low:
+            print(
+                "[SECURITY] blocked dangerous LINE text containing admin/token",
+                flush=True,
+            )
+            return safe_support_text()
+
+    return raw
 
 
 def line_headers(content_type="application/json"):
@@ -79,9 +153,10 @@ def require_internal_secret():
 
 
 def text_message(text):
+    safe_text = sanitize_line_text(text)
     return {
         "type": "text",
-        "text": str(text or "")[:5000],
+        "text": str(safe_text or "")[:5000],
     }
 
 
@@ -95,6 +170,25 @@ def image_message(image_url, preview_url=""):
     }
 
 
+def sanitize_messages(messages):
+    safe = []
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            safe.append(text_message(str(msg)))
+            continue
+
+        if msg.get("type") == "text":
+            msg = dict(msg)
+            msg["text"] = sanitize_line_text(msg.get("text", ""))
+            safe.append(msg)
+            continue
+
+        safe.append(msg)
+
+    return safe
+
+
 def reply_message(reply_token, messages):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return {"ok": False, "error": "LINE_CHANNEL_ACCESS_TOKEN not set"}
@@ -104,7 +198,7 @@ def reply_message(reply_token, messages):
 
     payload = {
         "replyToken": reply_token,
-        "messages": messages[:5],
+        "messages": sanitize_messages(messages)[:5],
     }
 
     try:
@@ -139,9 +233,17 @@ def push_message(to, messages):
     if not to:
         return {"ok": False, "error": "target LINE user id missing"}
 
+    if str(to).upper() == "ADMIN":
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "P0 security: admin LINE push disabled. Use admin email.",
+            "admin_contact_email": ADMIN_CONTACT_EMAIL,
+        }
+
     payload = {
         "to": to,
-        "messages": messages[:5],
+        "messages": sanitize_messages(messages)[:5],
     }
 
     try:
@@ -276,8 +378,9 @@ def normalize_web_role(role):
     if role in ("shop", "store"):
         return "store"
 
+    # P0 security: LINE must not create admin entry URLs.
     if role == "admin":
-        return "admin"
+        return "customer"
 
     return "customer"
 
@@ -297,17 +400,7 @@ def web_line_bind_url(role, line_user_id=""):
 
 
 def web_register_url(role, line_user_id=""):
-    """
-    Commercial FGO rule:
-    - Store / Driver registration must go through LINE binding.
-    - Customer can also bind here, but customer binding is optional in webapp.
-    - Do not send users to legacy /store/register or /driver/register from LINE.
-    """
     return web_line_bind_url(role, line_user_id)
-
-
-def admin_ops_url():
-    return f"{FGO_BASE_URL}/admin/ops?view=desktop&lang=zh"
 
 
 def menu_text(user_id=""):
@@ -321,17 +414,18 @@ def menu_text(user_id=""):
         "Webapp = 註冊 / 下單 / 上傳照片 / 營運\n"
         "LINE = 推送通知 / 客服 / 回到 webapp\n\n"
         "【註冊 / LINE 綁定】\n"
-        "店家與外送員必須完成 LINE 綁定後，才能等待 admin 審核。\n"
+        "店家與外送員必須完成 LINE 綁定後，才能等待審核。\n"
         "客戶可選擇綁定 LINE；未綁定仍可下單，但不會收到 LINE 推播與送達照片。\n\n"
         f"客戶 LINE 綁定：{customer_bind}\n"
         f"店家 LINE 綁定 / 註冊：{store_bind}\n"
         f"外送員 LINE 綁定 / 註冊：{driver_bind}\n\n"
         "【主要入口】\n"
-        f"FumapGo 首頁：{FGO_BASE_URL}/?view=mobile&lang=zh\n"
-        f"Marketplace：{FGO_BASE_URL}/go?view=mobile&lang=zh\n"
+        f"Marketplace：{PUBLIC_MARKETPLACE_URL}\n"
         f"店家工作台：{FGO_BASE_URL}/store?view=mobile&lang=zh\n"
         f"外送員工作台：{FGO_BASE_URL}/driver?view=mobile&lang=zh\n"
         f"客服：{FGO_BASE_URL}/support/new?view=mobile&lang=zh\n\n"
+        "系統或管理問題請聯絡 Email:\n"
+        f"{ADMIN_CONTACT_EMAIL}\n\n"
         "可輸入：\n"
         "menu\n"
         "我的入口\n"
@@ -370,7 +464,7 @@ def build_entry_text(user_id):
 
         if pending:
             return (
-                "⏳ 你的帳號正在等待管理員審核\n\n"
+                "⏳ 你的帳號正在等待審核\n\n"
                 f"角色：{role_label(role)}\n"
                 f"狀態：{status} / {approval}\n"
                 f"LINE User ID：{user_id}\n\n"
@@ -383,8 +477,8 @@ def build_entry_text(user_id):
         f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
         f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
         f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}\n\n"
-        "注意：店家與外送員必須完成 LINE 綁定並等待 admin 審核，才能正式使用。\n\n"
-        f"你的 LINE User ID：{user_id}"
+        "注意：店家與外送員必須完成 LINE 綁定並等待審核，才能正式使用。\n\n"
+        f"LINE User ID：{user_id}"
     )
 
 
@@ -433,27 +527,39 @@ def build_identity_text(user_id):
 
 
 def forward_customer_service_to_admin(user_id, text="", event_type="text"):
-    if not FGO_ADMIN_LINE_USER_ID:
-        return {
-            "ok": False,
-            "skipped": True,
-            "error": "FGO_ADMIN_LINE_USER_ID not set",
-        }
-
+    """
+    P0 security:
+    Do not forward CSKH to admin LINE.
+    Log only. User receives admin email in LINE reply.
+    """
     profile = get_line_profile(user_id)
     name = profile.get("displayName", "")
 
-    admin_text = (
-        "📩 FumapGo LINE CSKH\n\n"
-        f"User：{name or '-'}\n"
-        f"LINE User ID：{user_id}\n"
-        f"Type：{event_type}\n"
-        f"Time：{now_iso()}\n\n"
-        f"Message：\n{text or '-'}\n\n"
-        "Ghi chú: LINE hiện chỉ là CSKH + push. Nghiệp vụ chính xử lý trong webapp."
+    print(
+        "[LINE_CSKH]"
+        f" user={name or '-'}"
+        f" line_user_id={user_id}"
+        f" type={event_type}"
+        f" time={now_iso()}"
+        f" message={str(text or '-')[:1000]}",
+        flush=True,
     )
 
-    return push_text(FGO_ADMIN_LINE_USER_ID, admin_text)
+    return {
+        "ok": True,
+        "skipped_line_admin_push": True,
+        "admin_contact_email": ADMIN_CONTACT_EMAIL,
+    }
+
+
+def is_admin_intent(raw: str) -> bool:
+    text = (raw or "").strip()
+    low = text.lower()
+
+    if low in ADMIN_INTENT_KEYWORDS:
+        return True
+
+    return any(k in low for k in ADMIN_INTENT_KEYWORDS if k.isascii())
 
 
 def handle_text_message(user_id, reply_token, text):
@@ -474,6 +580,10 @@ def handle_text_message(user_id, reply_token, text):
         "帮助",
     }
 
+    if is_admin_intent(raw):
+        forward_customer_service_to_admin(user_id, raw, event_type="admin_intent_blocked")
+        return reply_message(reply_token, [text_message(safe_support_text())])
+
     if lower in menu_keywords or raw in menu_keywords:
         return reply_message(reply_token, [text_message(menu_text(user_id))])
 
@@ -491,7 +601,8 @@ def handle_text_message(user_id, reply_token, text):
             [
                 text_message(
                     "已收到你的客服訊息。\n\n"
-                    "Admin 會透過 LINE 或 webapp CSKH 回覆。\n"
+                    "如需系統或管理協助，請聯絡 Email:\n"
+                    f"{ADMIN_CONTACT_EMAIL}\n\n"
                     "若是訂單問題，請附上訂單碼。"
                 )
             ],
@@ -516,7 +627,7 @@ def handle_text_message(user_id, reply_token, text):
                     "現在 FumapGo 的正式流程如下：\n"
                     "1. 註冊、下單、上傳照片都在 webapp\n"
                     "2. LINE 只負責推送通知與客服\n\n"
-                    f"請使用 webapp：{FGO_BASE_URL}/go?view=mobile&lang=zh\n\n"
+                    f"請使用 Marketplace：{PUBLIC_MARKETPLACE_URL}\n\n"
                     f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
                     f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
                     f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}"
@@ -533,7 +644,9 @@ def handle_text_message(user_id, reply_token, text):
                 "已收到訊息。\n\n"
                 "LINE 目前作為通知與客服中心使用。\n"
                 "如需操作訂單、上傳付款或送達照片，請回到 webapp。\n\n"
-                f"Marketplace：{FGO_BASE_URL}/go?view=mobile&lang=zh\n"
+                f"Marketplace：{PUBLIC_MARKETPLACE_URL}\n\n"
+                "系統或管理問題請聯絡 Email:\n"
+                f"{ADMIN_CONTACT_EMAIL}\n\n"
                 "輸入「menu」可查看入口。"
             )
         ],
@@ -558,7 +671,10 @@ def health():
         line_token_set=bool(LINE_CHANNEL_ACCESS_TOKEN),
         line_secret_set=bool(LINE_CHANNEL_SECRET),
         internal_secret_set=bool(FGO_INTERNAL_SECRET),
-        admin_line_set=bool(FGO_ADMIN_LINE_USER_ID),
+        admin_line_env_set=bool(FGO_ADMIN_LINE_USER_ID),
+        admin_line_push_enabled=False,
+        admin_contact_email=ADMIN_CONTACT_EMAIL,
+        public_marketplace_url=PUBLIC_MARKETPLACE_URL,
         routes=[
             "/callback",
             "/internal/push",
@@ -585,9 +701,14 @@ def internal_push():
     ).strip()
 
     if to.upper() == "ADMIN":
-        to = FGO_ADMIN_LINE_USER_ID
+        return json_ok(
+            skipped=True,
+            reason="P0 security: admin LINE push disabled. Use admin email.",
+            admin_contact_email=ADMIN_CONTACT_EMAIL,
+        )
 
     text = str(payload.get("text") or payload.get("message") or "").strip()
+    text = sanitize_line_text(text)
 
     if not to:
         return json_fail("to / line_user_id missing", 400)
@@ -627,7 +748,11 @@ def internal_push_image():
     ).strip()
 
     if to.upper() == "ADMIN":
-        to = FGO_ADMIN_LINE_USER_ID
+        return json_ok(
+            skipped=True,
+            reason="P0 security: admin LINE image push disabled. Use admin email.",
+            admin_contact_email=ADMIN_CONTACT_EMAIL,
+        )
 
     image_url = str(
         payload.get("image_url") or payload.get("public_image_url") or ""
@@ -636,6 +761,7 @@ def internal_push_image():
         payload.get("preview_url") or payload.get("preview_image_url") or image_url
     ).strip()
     text = str(payload.get("text") or payload.get("message") or "").strip()
+    text = sanitize_line_text(text)
 
     if not to:
         return json_fail("to / line_user_id missing", 400)
@@ -677,9 +803,15 @@ def internal_photo_session():
     line_user_id = (
         payload.get("line_user_id")
         or payload.get("to")
-        or FGO_ADMIN_LINE_USER_ID
         or ""
     ).strip()
+
+    if line_user_id.upper() == "ADMIN":
+        return json_ok(
+            skipped=True,
+            reason="P0 security: admin LINE photo-session push disabled.",
+            admin_contact_email=ADMIN_CONTACT_EMAIL,
+        )
 
     order_code = str(payload.get("order_code") or "").strip()
     actor_role = str(payload.get("actor_role") or "DRIVER").strip().upper()
@@ -770,8 +902,10 @@ def callback():
                             text_message(
                                 "已收到圖片提醒，但 LINE 不再作為正式上傳 proof 的地方。\n\n"
                                 "付款截圖 / 送達照片請到 webapp 上傳，系統才會記錄 block。\n\n"
-                                f"Marketplace：{FGO_BASE_URL}/go?view=mobile&lang=zh\n"
-                                f"客服：{FGO_BASE_URL}/support/new?view=mobile&lang=zh"
+                                f"Marketplace：{PUBLIC_MARKETPLACE_URL}\n"
+                                f"客服：{FGO_BASE_URL}/support/new?view=mobile&lang=zh\n\n"
+                                "系統或管理問題請聯絡 Email:\n"
+                                f"{ADMIN_CONTACT_EMAIL}"
                             )
                         ],
                     )
@@ -790,7 +924,8 @@ def callback():
                         [
                             text_message(
                                 "此類訊息已收到，但正式操作請回 webapp。\n"
-                                "輸入 menu 可查看入口。"
+                                "輸入 menu 可查看入口。\n\n"
+                                f"Marketplace：{PUBLIC_MARKETPLACE_URL}"
                             )
                         ],
                     )
@@ -806,20 +941,13 @@ def callback():
         except Exception as e:
             print(f"[CALLBACK_EVENT_ERROR] {e}", flush=True)
 
-            try:
-                if FGO_ADMIN_LINE_USER_ID:
-                    push_text(
-                        FGO_ADMIN_LINE_USER_ID,
-                        "⚠️ FumapGo linehook callback error\n\n"
-                        f"Error: {e}\n"
-                        f"Time: {now_iso()}",
-                    )
-            except Exception:
-                pass
+            # P0 security: do not push callback error to admin LINE.
+            print(
+                "[LINEHOOK_ERROR]"
+                f" error={e}"
+                f" time={now_iso()}"
+                f" admin_contact_email={ADMIN_CONTACT_EMAIL}",
+                flush=True,
+            )
 
     return "OK"
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
