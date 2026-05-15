@@ -18,17 +18,15 @@ LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
 
 FGO_BASE_URL = os.getenv("FGO_BASE_URL", "https://fumapgo.onrender.com").rstrip("/")
 FGO_INTERNAL_SECRET = os.getenv("FGO_INTERNAL_SECRET", "")
-APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-commercial-binding-gateway")
+APP_MODE = os.getenv("APP_MODE", "fumapgo-linehook-notification-gateway")
 
-# P0 security:
-# LINE must never expose admin URL/token. Admin support falls back to email.
 ADMIN_CONTACT_EMAIL = os.getenv("ADMIN_CONTACT_EMAIL", "panjiaphu@gmail.com")
 PUBLIC_MARKETPLACE_URL = os.getenv(
     "PUBLIC_MARKETPLACE_URL",
     f"{FGO_BASE_URL}/go?view=mobile&lang=zh",
 )
 
-# Kept only for backward ENV compatibility. Do not use for CSKH forwarding.
+# Compatibility only. Admin LINE push is intentionally disabled.
 FGO_ADMIN_LINE_USER_ID = os.getenv("FGO_ADMIN_LINE_USER_ID", "")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
@@ -46,6 +44,8 @@ DANGEROUS_LINE_TEXT_KEYS = (
     "admin/payments",
     "admin/proof",
     "admin/waitblock",
+    "admin_token",
+    "ADMIN_TOKEN",
     "token=",
     "fumapgo_admin",
     "fgo_admin",
@@ -84,8 +84,9 @@ def json_fail(message, status_code=400, **kwargs):
 def safe_support_text():
     return (
         "已收到訊息。\n\n"
-        "FumapGo LINE 目前作為通知與客服入口使用。\n"
-        "如需處理訂單、付款、外送或管理功能，請回到 FumapGo Webapp。\n\n"
+        "FumapGo LINE 目前只作為通知與客服入口使用。\n"
+        "LINE 不建立帳號、不登入、不授權，也不做 Admin 審核。\n\n"
+        "如需註冊、登入、接單、下單、上傳照片或付款，請回到 FumapGo Webapp。\n\n"
         f"Marketplace:\n{PUBLIC_MARKETPLACE_URL}\n\n"
         "系統或管理問題請聯絡 Email:\n"
         f"{ADMIN_CONTACT_EMAIL}"
@@ -95,8 +96,7 @@ def safe_support_text():
 def sanitize_line_text(text: str) -> str:
     """
     P0 guardrail:
-    Any outgoing LINE text containing admin path/token is replaced.
-    This protects both reply_message and internal push_message.
+    Never send admin route/token through LINE.
     """
     raw = str(text or "")
     low = raw.lower()
@@ -378,7 +378,6 @@ def normalize_web_role(role):
     if role in ("shop", "store"):
         return "store"
 
-    # P0 security: LINE must not create admin entry URLs.
     if role == "admin":
         return "customer"
 
@@ -389,9 +388,9 @@ def web_line_bind_url(role, line_user_id=""):
     """
     Account-first LINE bind.
 
-    Do not open old MVP /line/register directly as a public registration form.
-    Always send user through webapp login first. After login, /line/register
-    binds LINE to the currently logged-in account/role.
+    The user must login to FUMAP GO Webapp first.
+    After login, /line/register binds LINE to the current account/role.
+    LINE never creates account or grants permission.
     """
     role = normalize_web_role(role)
     role_q = quote_plus(role)
@@ -433,12 +432,12 @@ def menu_text(user_id=""):
     return (
         "FumapGo LINE 通知中心\n\n"
         "正式規則：\n"
-        "Webapp = 註冊 / 下單 / 上傳照片 / 營運\n"
+        "Webapp = 註冊 / 登入 / 下單 / 接單 / 上傳照片 / 營運\n"
         "LINE = 推送通知 / 客服 / 回到 webapp\n\n"
+        "LINE 不建立帳號、不登入、不授權，也不需要 Admin 審核。\n\n"
         "【LINE 綁定】\n"
         "請先在 webapp 建立帳號並登入，再從 Menu 進入 LINE 綁定。\n"
-        "店家與外送員：LINE 綁定後等待 Admin 審核；Admin 不會替本人簽約。\n"
-        "客戶：登入後可綁定 LINE 以接收訂單通知。\n\n"
+        "綁定完成後，LINE 只用於接收通知、proof、訂單提醒與客服訊息。\n\n"
         f"客戶登入後綁定 LINE：{customer_bind}\n"
         f"店家登入後綁定 LINE：{store_bind}\n"
         f"外送員登入後綁定 LINE：{driver_bind}\n\n"
@@ -471,8 +470,6 @@ def build_entry_text(user_id):
         urls = body.get("urls") or {}
 
         active = bool(body.get("active"))
-        pending = bool(body.get("pending"))
-
         role = body.get("active_role") or binding.get("active_role") or ""
         status = binding.get("status") or body.get("status") or ""
         approval = binding.get("approval_status") or body.get("approval_status") or ""
@@ -481,7 +478,7 @@ def build_entry_text(user_id):
             return (
                 "✅ 我的 FumapGo 入口\n\n"
                 f"角色：{role_label(role)}\n"
-                f"狀態：{status} / {approval}\n"
+                f"LINE 狀態：{status} / {approval}\n"
                 f"LINE User ID：{user_id}\n\n"
                 f"入口：{urls.get('entry_url', '')}\n"
                 f"通知中心：{urls.get('notification_url', '')}\n"
@@ -489,18 +486,18 @@ def build_entry_text(user_id):
                 "LINE 只負責通知與客服，所有操作請回 webapp。"
             )
 
-        if pending:
-            return (
-                "⏳ 你的帳號正在等待審核\n\n"
-                f"角色：{role_label(role)}\n"
-                f"狀態：{status} / {approval}\n"
-                f"LINE User ID：{user_id}\n\n"
-                f"查看狀態：{body.get('pending_url') or web_line_bind_url(role, user_id)}"
-            )
+        return (
+            "你的 LINE contact 目前不是 ACTIVE。\n\n"
+            f"角色：{role_label(role)}\n"
+            f"狀態：{status} / {approval}\n"
+            f"LINE User ID：{user_id}\n\n"
+            "請重新登入 webapp，從 Menu 進入 LINE 綁定 / 狀態。"
+        )
 
     return (
         "你目前還沒有完成 LINE 綁定。\n\n"
-        "正式流程：先建立 webapp 帳號並登入，再從 Menu 進入 LINE 綁定。\n\n"
+        "正式流程：先建立 webapp 帳號並登入，再從 Menu 進入 LINE 綁定。\n"
+        "LINE 不建立帳號、不登入、不授權，也不需要 Admin 審核。\n\n"
         f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
         f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
         f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}\n\n"
@@ -527,6 +524,8 @@ def build_identity_text(user_id):
             f"LINE User ID：{user_id}",
             f"角色：{role_label(role)}",
             f"狀態：{status} / {approval}",
+            "",
+            "說明：LINE 只用於通知與客服，不是登入或授權。",
         ]
 
         if binding.get("customer_phone"):
@@ -549,7 +548,8 @@ def build_identity_text(user_id):
 
     return (
         "尚未綁定 LINE 身份。\n\n"
-        "請先登入 webapp，再綁定 LINE。\n\n"
+        "請先登入 webapp，再從 Menu 綁定 LINE。\n"
+        "LINE 不建立帳號、不登入、不授權，也不需要 Admin 審核。\n\n"
         f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
         f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
         f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}\n\n"
@@ -656,8 +656,9 @@ def handle_text_message(user_id, reply_token, text):
                 text_message(
                     "此 LINE 指令已停用。\n\n"
                     "現在 FumapGo 的正式流程如下：\n"
-                    "1. 註冊、下單、上傳照片都在 webapp\n"
-                    "2. LINE 只負責推送通知與客服\n\n"
+                    "1. 註冊、登入、下單、接單、上傳照片都在 webapp\n"
+                    "2. LINE 只負責推送通知與客服\n"
+                    "3. LINE 不建立帳號、不登入、不授權，也不需要 Admin 審核\n\n"
                     f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
                     f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
                     f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}"
@@ -971,7 +972,6 @@ def callback():
         except Exception as e:
             print(f"[CALLBACK_EVENT_ERROR] {e}", flush=True)
 
-            # P0 security: do not push callback error to admin LINE.
             print(
                 "[LINEHOOK_ERROR]"
                 f" error={e}"
