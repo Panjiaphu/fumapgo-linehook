@@ -386,21 +386,43 @@ def normalize_web_role(role):
 
 
 def web_line_bind_url(role, line_user_id=""):
+    """
+    Account-first LINE bind.
+
+    Do not open old MVP /line/register directly as a public registration form.
+    Always send user through webapp login first. After login, /line/register
+    binds LINE to the currently logged-in account/role.
+    """
     role = normalize_web_role(role)
     role_q = quote_plus(role)
     line_user_id_q = quote_plus(line_user_id or "")
 
-    return (
-        f"{FGO_BASE_URL}/line/register"
+    next_path = (
+        f"/line/register"
         f"?role={role_q}"
         f"&line_user_id={line_user_id_q}"
         f"&view=mobile"
         f"&lang=zh"
     )
 
+    return (
+        f"{FGO_BASE_URL}/login"
+        f"?next={quote_plus(next_path)}"
+        f"&view=mobile"
+        f"&lang=zh"
+    )
+
 
 def web_register_url(role, line_user_id=""):
-    return web_line_bind_url(role, line_user_id)
+    role = normalize_web_role(role)
+
+    if role == "store":
+        return f"{FGO_BASE_URL}/store/register?view=mobile&lang=zh"
+
+    if role == "driver":
+        return f"{FGO_BASE_URL}/driver/register?view=mobile&lang=zh"
+
+    return f"{FGO_BASE_URL}/login?view=mobile&lang=zh"
 
 
 def menu_text(user_id=""):
@@ -413,12 +435,17 @@ def menu_text(user_id=""):
         "正式規則：\n"
         "Webapp = 註冊 / 下單 / 上傳照片 / 營運\n"
         "LINE = 推送通知 / 客服 / 回到 webapp\n\n"
-        "【註冊 / LINE 綁定】\n"
-        "店家與外送員必須完成 LINE 綁定後，才能等待審核。\n"
-        "客戶可選擇綁定 LINE；未綁定仍可下單，但不會收到 LINE 推播與送達照片。\n\n"
-        f"客戶 LINE 綁定：{customer_bind}\n"
-        f"店家 LINE 綁定 / 註冊：{store_bind}\n"
-        f"外送員 LINE 綁定 / 註冊：{driver_bind}\n\n"
+        "【LINE 綁定】\n"
+        "請先在 webapp 建立帳號並登入，再從 Menu 進入 LINE 綁定。\n"
+        "店家與外送員：LINE 綁定後等待 Admin 審核；Admin 不會替本人簽約。\n"
+        "客戶：登入後可綁定 LINE 以接收訂單通知。\n\n"
+        f"客戶登入後綁定 LINE：{customer_bind}\n"
+        f"店家登入後綁定 LINE：{store_bind}\n"
+        f"外送員登入後綁定 LINE：{driver_bind}\n\n"
+        "【建立帳號】\n"
+        f"店家註冊：{web_register_url('store', user_id)}\n"
+        f"外送員註冊：{web_register_url('driver', user_id)}\n"
+        f"登入：{FGO_BASE_URL}/login?view=mobile&lang=zh\n\n"
         "【主要入口】\n"
         f"Marketplace：{PUBLIC_MARKETPLACE_URL}\n"
         f"店家工作台：{FGO_BASE_URL}/store?view=mobile&lang=zh\n"
@@ -473,11 +500,14 @@ def build_entry_text(user_id):
 
     return (
         "你目前還沒有完成 LINE 綁定。\n\n"
-        "請使用下方入口完成 FumapGo 註冊 / LINE 綁定：\n\n"
-        f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
-        f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
-        f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}\n\n"
-        "注意：店家與外送員必須完成 LINE 綁定並等待審核，才能正式使用。\n\n"
+        "正式流程：先建立 webapp 帳號並登入，再從 Menu 進入 LINE 綁定。\n\n"
+        f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
+        f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
+        f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}\n\n"
+        "建立帳號：\n"
+        f"店家註冊：{web_register_url('store', user_id)}\n"
+        f"外送員註冊：{web_register_url('driver', user_id)}\n"
+        f"登入：{FGO_BASE_URL}/login?view=mobile&lang=zh\n\n"
         f"LINE User ID：{user_id}"
     )
 
@@ -519,9 +549,10 @@ def build_identity_text(user_id):
 
     return (
         "尚未綁定 LINE 身份。\n\n"
-        f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
-        f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
-        f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}\n\n"
+        "請先登入 webapp，再綁定 LINE。\n\n"
+        f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
+        f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
+        f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}\n\n"
         f"LINE User ID：{user_id}"
     )
 
@@ -627,10 +658,9 @@ def handle_text_message(user_id, reply_token, text):
                     "現在 FumapGo 的正式流程如下：\n"
                     "1. 註冊、下單、上傳照片都在 webapp\n"
                     "2. LINE 只負責推送通知與客服\n\n"
-                    f"請使用 Marketplace：{PUBLIC_MARKETPLACE_URL}\n\n"
-                    f"客戶 LINE 綁定：{web_line_bind_url('customer', user_id)}\n"
-                    f"店家 LINE 綁定 / 註冊：{web_line_bind_url('store', user_id)}\n"
-                    f"外送員 LINE 綁定 / 註冊：{web_line_bind_url('driver', user_id)}"
+                    f"客戶登入後綁定 LINE：{web_line_bind_url('customer', user_id)}\n"
+                    f"店家登入後綁定 LINE：{web_line_bind_url('store', user_id)}\n"
+                    f"外送員登入後綁定 LINE：{web_line_bind_url('driver', user_id)}"
                 )
             ],
         )
